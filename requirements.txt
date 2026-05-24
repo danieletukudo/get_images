@@ -1,4 +1,4 @@
-flask
+fastapi
+uvicorn[standard]
 requests
-beautifulsoup4
-flask-cors
+playwright

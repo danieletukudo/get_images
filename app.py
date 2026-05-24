@@ -26,8 +26,6 @@ async def find_image(body: SearchRequest):
 
     try:
         img_url = await asyncio.to_thread(get_image_url, query)
-    except RuntimeError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=502)
     except Exception:
         return JSONResponse({"error": "Image search failed"}, status_code=500)
 

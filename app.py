@@ -24,6 +24,7 @@ async def find_image(body: SearchRequest):
     if not query:
         return JSONResponse({"error": "Missing 'q'"}, status_code=400)
 
+
     try:
         img_url = await asyncio.to_thread(get_image_url, query)
     except Exception:

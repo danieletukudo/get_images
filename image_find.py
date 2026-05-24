@@ -1,14 +1,21 @@
+import logging
+import os
 import re
 import sys
 import time
 from urllib.parse import quote_plus
 
 import requests
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
+logger = logging.getLogger(__name__)
+
 CANDIDATE_LIMIT = 30
-GOOGLE_RETRIES = 3
+_default_retries = "1" if os.environ.get("RENDER") else "3"
+GOOGLE_RETRIES = int(os.environ.get("GOOGLE_RETRIES", _default_retries))
 RETRY_DELAY_SECONDS = 2
+PAGE_TIMEOUT_MS = 45_000
 
 headers = {
     "User-Agent": (
@@ -67,12 +74,15 @@ def build_bing_search_url(keyword: str) -> str:
 def _launch_browser_page(playwright):
     launch_kwargs = {
         "headless": True,
-        "args": ["--disable-blink-features=AutomationControlled"],
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
     }
-    try:
-        browser = playwright.chromium.launch(channel="chrome", **launch_kwargs)
-    except Exception:
-        browser = playwright.chromium.launch(**launch_kwargs)
+    browser = playwright.chromium.launch(**launch_kwargs)
 
     context = browser.new_context(
         user_agent=headers["User-Agent"],
@@ -86,18 +96,26 @@ def _launch_browser_page(playwright):
 
 
 def fetch_page_html(url: str, blocked_marker: str | None = None) -> str | None:
-    """Load a search page in a browser. Returns None if blocked."""
-    with sync_playwright() as playwright:
-        browser, page = _launch_browser_page(playwright)
-        page.goto(url, wait_until="networkidle", timeout=90_000)
+    """Load a search page in a browser. Returns None if blocked or on error."""
+    try:
+        with sync_playwright() as playwright:
+            browser, page = _launch_browser_page(playwright)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+                page.wait_for_timeout(2000)
 
-        if blocked_marker and blocked_marker in page.url:
-            browser.close()
-            return None
+                if blocked_marker and blocked_marker in page.url:
+                    return None
 
-        html = page.content()
-        browser.close()
-        return html
+                return page.content()
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        logger.warning("Playwright failed for %s: %s", url, exc)
+        return None
+    except Exception as exc:
+        logger.exception("Browser fetch failed for %s: %s", url, exc)
+        return None
 
 
 def normalize_url(url: str) -> str:

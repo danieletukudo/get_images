@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from image_find import (
-    GoogleApiNotConfiguredError,
+    SerpApiNotConfiguredError,
     get_accessible_image_url as get_image_url,
 )
 
@@ -33,7 +33,7 @@ async def find_image(body: SearchRequest):
 
     try:
         img_url = await asyncio.to_thread(get_image_url, query)
-    except GoogleApiNotConfiguredError as exc:
+    except SerpApiNotConfiguredError as exc:
         return JSONResponse({"error": str(exc)}, status_code=503)
     except RuntimeError as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)

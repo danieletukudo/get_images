@@ -1,18 +1,25 @@
-"""Find a food image URL via Google Custom Search JSON API (image search)."""
+"""Find a food image URL via SerpAPI Google Images search."""
 
 import logging
 import os
 import re
 import sys
+from pathlib import Path
 
 import requests
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
-GOOGLE_CX = os.environ.get("GOOGLE_CX", "96354acc97e1a4c5e").strip()
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "").strip()
 CANDIDATE_LIMIT = 10
-API_URL = "https://www.googleapis.com/customsearch/v1"
+API_URL = "https://serpapi.com/search.json"
 
 _HEADERS = {
     "User-Agent": (
@@ -30,8 +37,8 @@ _BLOCKED_DOMAINS = (
 )
 
 
-class GoogleApiNotConfiguredError(RuntimeError):
-    """Raised when GOOGLE_API_KEY is missing."""
+class SerpApiNotConfiguredError(RuntimeError):
+    """Raised when SERPAPI_KEY is missing."""
 
 
 def _add_food_context(keyword: str) -> str:
@@ -70,37 +77,35 @@ def relevance_score(url: str, keyword: str) -> int:
 
 
 def search_google_images(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str]:
-    """Call Google Custom Search API (image search)."""
-    if not GOOGLE_API_KEY:
-        raise GoogleApiNotConfiguredError(
-            "Set GOOGLE_API_KEY environment variable (Google Cloud API key)."
+    """Search Google Images via SerpAPI."""
+    if not SERPAPI_KEY:
+        raise SerpApiNotConfiguredError(
+            "Set SERPAPI_KEY environment variable. Get one at https://serpapi.com/"
         )
 
     query = _add_food_context(keyword)
     params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CX,
+        "engine": "google_images",
         "q": query,
-        "searchType": "image",
-        "num": min(limit, 10),
+        "api_key": SERPAPI_KEY,
         "safe": "active",
-        "imgSize": "large",
-        "imgType": "photo",
+        "num": min(limit, 10),
     }
 
-    response = requests.get(API_URL, params=params, timeout=15)
-    if response.status_code == 403:
-        logger.error("Google API 403: %s", response.text[:500])
-        raise RuntimeError("Google API access denied. Check API key and billing.")
+    response = requests.get(API_URL, params=params, timeout=20)
+    if response.status_code == 401:
+        raise RuntimeError("SerpAPI key is invalid.")
     if response.status_code == 429:
-        logger.error("Google API quota exceeded")
-        raise RuntimeError("Google API daily quota exceeded (100 free/day).")
+        raise RuntimeError("SerpAPI monthly quota exceeded (100 free/month).")
     response.raise_for_status()
 
     data = response.json()
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+
     urls: list[str] = []
-    for item in data.get("items", []):
-        link = item.get("link", "").strip()
+    for item in data.get("images_results", []):
+        link = (item.get("original") or item.get("link") or "").strip()
         if not link.startswith("http"):
             continue
         if is_blocked_url(link):
@@ -146,7 +151,7 @@ def main() -> None:
 
     try:
         url = get_accessible_image_url(keyword)
-    except GoogleApiNotConfiguredError as exc:
+    except SerpApiNotConfiguredError as exc:
         print(f"Error: {exc}")
         return
     except RuntimeError as exc:

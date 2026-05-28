@@ -1,302 +1,128 @@
+"""Find a food image URL via Google Custom Search JSON API (image search)."""
+
 import logging
 import os
 import re
 import sys
-import time
-from urllib.parse import quote_plus
 
 import requests
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
-CANDIDATE_LIMIT = 30
-_default_retries = "1" if os.environ.get("RENDER") else "3"
-GOOGLE_RETRIES = int(os.environ.get("GOOGLE_RETRIES", _default_retries))
-RETRY_DELAY_SECONDS = 2
-PAGE_TIMEOUT_MS = 45_000
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+GOOGLE_CX = os.environ.get("GOOGLE_CX", "96354acc97e1a4c5e").strip()
+CANDIDATE_LIMIT = 10
+API_URL = "https://www.googleapis.com/customsearch/v1"
 
-headers = {
+_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "image/*,*/*",
+    "Referer": "https://www.google.com/",
 }
 
-_GOOGLE_IMAGE_PATTERN = re.compile(
-    r'\["(https?://[^"]+)",\s*(\d+),\s*(\d+)\]'
-)
-_BING_MURL_PATTERNS = (
-    re.compile(r'murl&quot;:&quot;(https?://[^&]+?)&quot;'),
-    re.compile(r'"murl":"(https?://[^"]+)"'),
-)
-_SKIP_DOMAINS = ("tiktok.com/api", "gstatic.com", "google.com")
 _BLOCKED_DOMAINS = (
-    "xhcdn.com",
-    "phncdn.com",
-    "porn",
-    "pixhost",
-    "imagetwist",
-    "adultempire",
-    "redir.me",
-    "vrporn",
-    "pimpandhost",
-    "ttcache.com",
-)
-_BLOCKED_URL_HINTS = ("sorry", "captcha", "recaptcha")
-_JUNK_URL_FRAGMENTS = (
-    "profile_images",
-    "/logo",
-    "favicon",
-    "/icon",
-    "avatar",
-    "sprite",
-    "1x1",
-    "pixel",
+    "porn", "xhcdn.com", "phncdn.com", "xhamster", "xvideos", "xnxx",
+    "redtube", "youporn", "spankbang", "pornhub", "onlyfans",
+    "pixhost", "imagetwist", "adultempire", "vrporn", "pimpandhost",
 )
 
 
-def build_google_search_url(keyword: str) -> str:
-    return f"https://www.google.com/search?q={quote_plus(keyword.strip())}&udm=2"
+class GoogleApiNotConfiguredError(RuntimeError):
+    """Raised when GOOGLE_API_KEY is missing."""
 
 
-def build_bing_search_url(keyword: str) -> str:
-    return (
-        f"https://www.bing.com/images/search"
-        f"?q={quote_plus(keyword.strip())}&form=HDRSC2&first=1"
-    )
-
-
-def _launch_browser_page(playwright):
-    launch_kwargs = {
-        "headless": True,
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-        ],
+def _add_food_context(keyword: str) -> str:
+    food_words = {
+        "food", "dish", "recipe", "meal", "cuisine", "soup", "stew",
+        "salad", "rice", "bread", "cake", "cooking", "cook", "plate",
     }
-    browser = playwright.chromium.launch(**launch_kwargs)
-
-    context = browser.new_context(
-        user_agent=headers["User-Agent"],
-        locale="en-US",
-        viewport={"width": 1440, "height": 812},
-    )
-    context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    return browser, context.new_page()
+    lower = keyword.lower()
+    if set(lower.split()) & food_words:
+        return keyword.strip()
+    return f"{keyword.strip()} food"
 
 
-def fetch_page_html(url: str, blocked_marker: str | None = None) -> str | None:
-    """Load a search page in a browser. Returns None if blocked or on error."""
-    try:
-        with sync_playwright() as playwright:
-            browser, page = _launch_browser_page(playwright)
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-                page.wait_for_timeout(2000)
-
-                if blocked_marker and blocked_marker in page.url:
-                    return None
-
-                return page.content()
-            finally:
-                browser.close()
-    except PlaywrightError as exc:
-        logger.warning("Playwright failed for %s: %s", url, exc)
-        return None
-    except Exception as exc:
-        logger.exception("Browser fetch failed for %s: %s", url, exc)
-        return None
-
-
-def normalize_url(url: str) -> str:
-    return url.replace("\\u003d", "=").replace("\\u0026", "&")
-
-
-def is_blocked_domain(url: str) -> bool:
+def is_blocked_url(url: str) -> bool:
     lower = url.lower()
-    return any(domain in lower for domain in _BLOCKED_DOMAINS)
-
-
-def is_image_url(url: str) -> bool:
-    if any(skip in url for skip in _SKIP_DOMAINS):
-        return False
-    if is_blocked_domain(url):
-        return False
-    lower = url.lower()
-    if any(junk in lower for junk in _JUNK_URL_FRAGMENTS):
-        return False
-    return any(
-        ext in lower
-        for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", "/upload", "/images/")
-    )
+    return any(blocked in lower for blocked in _BLOCKED_DOMAINS)
 
 
 def query_words(keyword: str) -> list[str]:
     return [
-        word.lower()
-        for word in re.findall(r"\w+", keyword)
-        if len(word) > 2 and word.lower() not in {"and", "with", "the"}
+        w.lower()
+        for w in re.findall(r"\w+", keyword)
+        if len(w) > 2 and w.lower() not in {"and", "with", "the", "for", "food"}
     ]
 
 
 def relevance_score(url: str, keyword: str) -> int:
     words = query_words(keyword)
     lower = url.lower()
-    score = sum(1 for word in words if word in lower)
-    if "wp-content/uploads" in lower:
+    score = sum(1 for w in words if w in lower)
+    if "wp-content/uploads" in lower or "/uploads/" in lower:
         score += 2
-    if "/recipes/" in lower or "recipe" in lower:
+    if "recipe" in lower or "food" in lower:
         score += 1
     return score
 
 
-def _extract_google_candidates(
-    html: str, limit: int
-) -> list[tuple[str, int, int]]:
-    candidates: list[tuple[str, int, int]] = []
-    seen: set[str] = set()
-    for url, width, height in _GOOGLE_IMAGE_PATTERN.findall(html):
-        url = normalize_url(url)
-        if url in seen or not is_image_url(url):
-            continue
-        seen.add(url)
-        candidates.append((url, int(width), int(height)))
-        if len(candidates) >= limit:
-            break
-    return candidates
+def search_google_images(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str]:
+    """Call Google Custom Search API (image search)."""
+    if not GOOGLE_API_KEY:
+        raise GoogleApiNotConfiguredError(
+            "Set GOOGLE_API_KEY environment variable (Google Cloud API key)."
+        )
 
+    query = _add_food_context(keyword)
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CX,
+        "q": query,
+        "searchType": "image",
+        "num": min(limit, 10),
+        "safe": "active",
+        "imgSize": "large",
+        "imgType": "photo",
+    }
 
-def rank_google_candidates(
-    candidates: list[tuple[str, int, int]], keyword: str
-) -> list[str]:
-    words = query_words(keyword)
-    scored: list[tuple[str, int, int]] = []
-    for url, width, height in candidates:
-        if width * height < 40_000:
-            continue
-        lower = url.lower()
-        relevance = sum(1 for word in words if word in lower)
-        scored.append((url, relevance, width * height))
+    response = requests.get(API_URL, params=params, timeout=15)
+    if response.status_code == 403:
+        logger.error("Google API 403: %s", response.text[:500])
+        raise RuntimeError("Google API access denied. Check API key and billing.")
+    if response.status_code == 429:
+        logger.error("Google API quota exceeded")
+        raise RuntimeError("Google API daily quota exceeded (100 free/day).")
+    response.raise_for_status()
 
-    scored.sort(key=lambda item: (item[1], item[2]), reverse=True)
-    return [url for url, _, _ in scored]
-
-
-def _extract_bing_urls(html: str, limit: int) -> list[str]:
+    data = response.json()
     urls: list[str] = []
-    seen: set[str] = set()
-    for pattern in _BING_MURL_PATTERNS:
-        for match in pattern.findall(html):
-            url = normalize_url(match.replace("&amp;", "&"))
-            if url in seen or not url.startswith("http") or not is_image_url(url):
-                continue
-            seen.add(url)
-            urls.append(url)
-            if len(urls) >= limit:
-                return urls
+    for item in data.get("items", []):
+        link = item.get("link", "").strip()
+        if not link.startswith("http"):
+            continue
+        if is_blocked_url(link):
+            continue
+        urls.append(link)
+
+    urls.sort(key=lambda u: relevance_score(u, keyword), reverse=True)
     return urls
 
 
-def rank_bing_candidates(urls: list[str], keyword: str) -> list[str]:
-    """Strict ranking for Bing — skip URLs that don't match the search."""
-    words = query_words(keyword)
-    min_relevance = min(2, len(words)) if words else 1
-
-    scored: list[tuple[str, int]] = []
-    for url in urls:
-        lower = url.lower()
-        if "/thumb/" in lower and any(size in lower for size in ("220px", "300px")):
-            continue
-        score = relevance_score(url, keyword)
-        if score < min_relevance:
-            continue
-        scored.append((url, score))
-
-    scored.sort(key=lambda item: item[1], reverse=True)
-    return [url for url, _ in scored]
-
-
-def get_google_image_urls(
-    keyword: str, limit: int = CANDIDATE_LIMIT
-) -> tuple[list[str], bool]:
-    search_url = build_google_search_url(keyword)
-    blocked_attempts = 0
-
-    for attempt in range(GOOGLE_RETRIES):
-        html = fetch_page_html(search_url, "google.com/sorry")
-        if html is None:
-            blocked_attempts += 1
-            if attempt < GOOGLE_RETRIES - 1:
-                time.sleep(RETRY_DELAY_SECONDS)
-            continue
-
-        candidates = _extract_google_candidates(html, limit)
-        if candidates:
-            return rank_google_candidates(candidates, keyword), False
-
-        if attempt < GOOGLE_RETRIES - 1:
-            time.sleep(RETRY_DELAY_SECONDS)
-
-    return [], blocked_attempts == GOOGLE_RETRIES
-
-
-def get_bing_image_urls(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str]:
-    html = fetch_page_html(build_bing_search_url(keyword))
-    if not html:
-        return []
-    urls = _extract_bing_urls(html, limit)
-    return rank_bing_candidates(urls, keyword)
-
-
-def get_image_candidates(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str]:
-    """Google first; Bing via browser if Google is blocked or empty."""
-    google_urls, google_blocked = get_google_image_urls(keyword, limit=limit)
-    if google_urls:
-        return google_urls
-    if google_blocked or not google_urls:
-        bing_urls = get_bing_image_urls(keyword, limit=limit)
-        if bing_urls:
-            return bing_urls
-    return []
-
-
 def is_url_accessible(url: str) -> bool:
-    """Return True if the URL opens and returns an image."""
-    request_headers = {
-        **headers,
-        "Referer": "https://www.google.com/",
-        "Accept": "image/*,*/*",
-    }
-
     try:
         response = requests.get(
-            url,
-            headers=request_headers,
-            timeout=10,
-            stream=True,
-            allow_redirects=True,
+            url, headers=_HEADERS, timeout=10, stream=True, allow_redirects=True
         )
         if response.status_code != 200:
             return False
-
-        final_url = response.url.lower()
-        if any(hint in final_url for hint in _BLOCKED_URL_HINTS):
+        if is_blocked_url(response.url):
             return False
-
         content_type = response.headers.get("Content-Type", "").lower()
         if content_type and not content_type.startswith("image/"):
             return False
-
         chunk = next(response.iter_content(512), None)
         return bool(chunk)
     except requests.RequestException:
@@ -304,13 +130,11 @@ def is_url_accessible(url: str) -> bool:
 
 
 def get_accessible_image_url(keyword: str) -> str | None:
-    """Return the best openable image URL from Google or Bing."""
-    candidates = get_image_candidates(keyword)
-
+    """Return the first openable, relevant image URL for *keyword*."""
+    candidates = search_google_images(keyword)
     for url in candidates:
         if is_url_accessible(url):
             return url
-
     return None
 
 
@@ -320,11 +144,17 @@ def main() -> None:
         print("Search keyword required.")
         return
 
-    print(f"Searching: {build_google_search_url(keyword)}")
+    try:
+        url = get_accessible_image_url(keyword)
+    except GoogleApiNotConfiguredError as exc:
+        print(f"Error: {exc}")
+        return
+    except RuntimeError as exc:
+        print(f"Error: {exc}")
+        return
 
-    image_url = get_accessible_image_url(keyword)
-    if image_url:
-        print(image_url)
+    if url:
+        print(url)
     else:
         print("No accessible image link found.")
 

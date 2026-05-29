@@ -1,4 +1,4 @@
-"""Find a food image URL via SerpAPI Google Images search."""
+"""Find a food image URL via Serper.dev Google Images API."""
 
 import logging
 import os
@@ -17,9 +17,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "").strip()
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 CANDIDATE_LIMIT = 10
-API_URL = "https://serpapi.com/search.json"
+API_URL = "https://google.serper.dev/images"
 
 _HEADERS = {
     "User-Agent": (
@@ -30,15 +30,21 @@ _HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
+_FOOD_DOMAINS = (
+    "seriouseats.com", "allrecipes.com", "epicurious.com", "foodnetwork.com",
+    "simplyrecipes.com", "bonappetit.com", "africanbites.com", "weeatatlast.com",
+    "cheflolaskitchen.com", "allnigerianfoods.com", "wikipedia.org",
+    "wp-content/uploads", "assets.epicurious.com",
+)
+
 _BLOCKED_DOMAINS = (
     "porn", "xhcdn.com", "phncdn.com", "xhamster", "xvideos", "xnxx",
     "redtube", "youporn", "spankbang", "pornhub", "onlyfans",
-    "pixhost", "imagetwist", "adultempire", "vrporn", "pimpandhost",
 )
 
 
-class SerpApiNotConfiguredError(RuntimeError):
-    """Raised when SERPAPI_KEY is missing."""
+class SerperNotConfiguredError(RuntimeError):
+    """Raised when SERPER_API_KEY is missing."""
 
 
 def _add_food_context(keyword: str) -> str:
@@ -65,55 +71,58 @@ def query_words(keyword: str) -> list[str]:
     ]
 
 
-def relevance_score(url: str, keyword: str) -> int:
+def relevance_score(url: str, keyword: str, title: str = "", domain: str = "") -> int:
     words = query_words(keyword)
-    lower = url.lower()
-    score = sum(1 for w in words if w in lower)
-    if "wp-content/uploads" in lower or "/uploads/" in lower:
-        score += 2
-    if "recipe" in lower or "food" in lower:
+    text = f"{url} {title} {domain}".lower()
+    score = sum(1 for w in words if w in text)
+    if any(safe in url.lower() for safe in _FOOD_DOMAINS):
+        score += 3
+    if "recipe" in text or "soup" in text or "food" in text:
         score += 1
     return score
 
 
 def search_google_images(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str]:
-    """Search Google Images via SerpAPI."""
-    if not SERPAPI_KEY:
-        raise SerpApiNotConfiguredError(
-            "Set SERPAPI_KEY environment variable. Get one at https://serpapi.com/"
+    """Search Google Images via Serper.dev."""
+    if not SERPER_API_KEY:
+        raise SerperNotConfiguredError(
+            "Set SERPER_API_KEY environment variable. Get one at https://serper.dev/"
         )
 
     query = _add_food_context(keyword)
-    params = {
-        "engine": "google_images",
-        "q": query,
-        "api_key": SERPAPI_KEY,
-        "safe": "active",
-        "num": min(limit, 10),
-    }
+    response = requests.post(
+        API_URL,
+        headers={
+            "X-API-KEY": SERPER_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={"q": query, "num": min(limit, 10)},
+        timeout=20,
+    )
 
-    response = requests.get(API_URL, params=params, timeout=20)
     if response.status_code == 401:
-        raise RuntimeError("SerpAPI key is invalid.")
+        raise RuntimeError("Serper API key is invalid.")
     if response.status_code == 429:
-        raise RuntimeError("SerpAPI monthly quota exceeded (100 free/month).")
+        raise RuntimeError("Serper API quota exceeded.")
     response.raise_for_status()
 
     data = response.json()
-    if data.get("error"):
-        raise RuntimeError(data["error"])
+    scored: list[tuple[str, int]] = []
 
-    urls: list[str] = []
-    for item in data.get("images_results", []):
-        link = (item.get("original") or item.get("link") or "").strip()
-        if not link.startswith("http"):
+    for item in data.get("images", []):
+        url = (item.get("imageUrl") or "").strip()
+        if not url.startswith("http") or is_blocked_url(url):
             continue
-        if is_blocked_url(link):
-            continue
-        urls.append(link)
+        score = relevance_score(
+            url,
+            keyword,
+            title=item.get("title", ""),
+            domain=item.get("domain", ""),
+        )
+        scored.append((url, score))
 
-    urls.sort(key=lambda u: relevance_score(u, keyword), reverse=True)
-    return urls
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [url for url, _ in scored]
 
 
 def is_url_accessible(url: str) -> bool:
@@ -140,7 +149,8 @@ def get_accessible_image_url(keyword: str) -> str | None:
     for url in candidates:
         if is_url_accessible(url):
             return url
-    return None
+    # If hotlink checks fail, return best Serper result (frontend can still display)
+    return candidates[0] if candidates else None
 
 
 def main() -> None:
@@ -151,7 +161,7 @@ def main() -> None:
 
     try:
         url = get_accessible_image_url(keyword)
-    except SerpApiNotConfiguredError as exc:
+    except SerperNotConfiguredError as exc:
         print(f"Error: {exc}")
         return
     except RuntimeError as exc:

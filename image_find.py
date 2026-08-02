@@ -17,7 +17,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
 CANDIDATE_LIMIT = 10
 API_URL = "https://google.serper.dev/images"
 
@@ -45,6 +44,11 @@ _BLOCKED_DOMAINS = (
 
 class SerperNotConfiguredError(RuntimeError):
     """Raised when SERPER_API_KEY is missing."""
+
+
+def get_serper_api_key() -> str:
+    """Read key at call time so Render env updates are picked up on restart."""
+    return os.environ.get("SERPER_API_KEY", "").strip()
 
 
 def _add_food_context(keyword: str) -> str:
@@ -82,9 +86,18 @@ def relevance_score(url: str, keyword: str, title: str = "", domain: str = "") -
     return score
 
 
+def _parse_serper_error(response: requests.Response) -> str:
+    try:
+        body = response.json()
+        return body.get("message") or body.get("error") or response.text
+    except Exception:
+        return response.text or f"HTTP {response.status_code}"
+
+
 def search_google_images(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str]:
     """Search Google Images via Serper.dev."""
-    if not SERPER_API_KEY:
+    api_key = get_serper_api_key()
+    if not api_key:
         raise SerperNotConfiguredError(
             "Set SERPER_API_KEY environment variable. Get one at https://serper.dev/"
         )
@@ -93,25 +106,25 @@ def search_google_images(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str
     response = requests.post(
         API_URL,
         headers={
-            "X-API-KEY": SERPER_API_KEY,
+            "X-API-KEY": api_key,
             "Content-Type": "application/json",
         },
         json={"q": query, "num": min(limit, 10)},
         timeout=20,
     )
 
-    if response.status_code == 401:
-        raise RuntimeError("Serper API key is invalid.")
+    if response.status_code == 401 or response.status_code == 403:
+        raise RuntimeError(f"Serper API unauthorized: {_parse_serper_error(response)}")
     if response.status_code == 429:
         raise RuntimeError("Serper API quota exceeded.")
     if response.status_code == 400:
-        try:
-            msg = response.json().get("message", response.text)
-        except Exception:
-            msg = response.text
+        msg = _parse_serper_error(response)
         logger.error("Serper API 400: %s", msg)
         raise RuntimeError(f"Serper API error: {msg}")
-    response.raise_for_status()
+    if not response.ok:
+        msg = _parse_serper_error(response)
+        logger.error("Serper API %s: %s", response.status_code, msg)
+        raise RuntimeError(f"Serper API error: {msg}")
 
     data = response.json()
     scored: list[tuple[str, int]] = []
@@ -156,7 +169,6 @@ def get_accessible_image_url(keyword: str) -> str | None:
     for url in candidates:
         if is_url_accessible(url):
             return url
-    # If hotlink checks fail, return best Serper result (frontend can still display)
     return candidates[0] if candidates else None
 
 

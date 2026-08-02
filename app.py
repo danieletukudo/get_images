@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from image_find import (
     SerperNotConfiguredError,
     get_accessible_image_url as get_image_url,
+    get_serper_api_key,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -21,8 +22,11 @@ class SearchRequest(BaseModel):
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, str | bool]:
+    return {
+        "status": "ok",
+        "serper_configured": bool(get_serper_api_key()),
+    }
 
 
 @app.post("/image")

@@ -104,6 +104,13 @@ def search_google_images(keyword: str, limit: int = CANDIDATE_LIMIT) -> list[str
         raise RuntimeError("Serper API key is invalid.")
     if response.status_code == 429:
         raise RuntimeError("Serper API quota exceeded.")
+    if response.status_code == 400:
+        try:
+            msg = response.json().get("message", response.text)
+        except Exception:
+            msg = response.text
+        logger.error("Serper API 400: %s", msg)
+        raise RuntimeError(f"Serper API error: {msg}")
     response.raise_for_status()
 
     data = response.json()
